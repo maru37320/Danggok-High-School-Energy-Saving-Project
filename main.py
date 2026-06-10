@@ -1,118 +1,248 @@
-"""
-교실 환경 모니터링 노드 — Phase 1 (온습도 + 조도).
-
-동작:
-1. WiFi 연결 (실패 시 지수 백오프 재시도, 5분 넘으면 reset)
-2. SHT40로 온습도, BH1750으로 조도 측정
-3. JSON으로 서버에 HTTP POST
-4. INTERVAL_SEC 만큼 대기 후 반복
-
-장애 대응:
-- 와치독 타이머 8초로 무한루프 방지
-- 네트워크 끊김 시 측정값을 flash에 버퍼링(최대 200건)했다가 재전송
-"""
-
-import json
 import time
+import gc
+import json
 import network
-import urequests
-from machine import WDT, reset
+from machine import I2C, Pin, ADC, WDT, reset
+import wifi_config
+time.sleep(5)
 
-import secrets
-import sensors
+def feed():
+    """와치독이 켜져 있을 때만 feed."""
+    global wdt
+    if wdt is not None:
+        wdt.feed()
+        
+try:
+    import usocket as socket
+except ImportError:
+    import socket
+try:
+    import ussl as ssl
+except ImportError:
+    import ssl
 
 
+print(">>> ===== 부팅! 코드 시작 =====")
+
+# ===== 와치독 (일단 만들지 말고, 변수만 준비) =====
+wdt = None   # ← 처음엔 None! 아직 시작 안 함
+
+
+# ===== 버퍼 설정 =====
 BUFFER_FILE = "buffer.jsonl"
 BUFFER_MAX = 200
 
-wdt = WDT(timeout=8000)
+# ===== 측정 간격 =====
+INTERVAL_SEC = 30
 
 
-def log(msg):
-    print("[{}] {}".format(time.ticks_ms(), msg))
+# ===== 하드웨어: SHT40 (I2C) =====
+i2c = I2C(0, sda=Pin(8), scl=Pin(9), freq=100000)
+SHT40_ADDR = 0x44
+print(">>> I2C 스캔:", [hex(x) for x in i2c.scan()])
+
+# ===== 하드웨어: 조도 센서 (아날로그, GP26) =====
+light_sensor = ADC(Pin(26))
+
+
+def read_sht40():
+    """SHT40에서 온도(°C), 습도(%) 읽기."""
+    # 고정밀 측정 명령 0xFD
+    i2c.writeto(SHT40_ADDR, b'\xFD')
+    time.sleep_ms(10)
+    data = i2c.readfrom(SHT40_ADDR, 6)
+    # 온도 계산
+    t_ticks = data[0] * 256 + data[1]
+    temp = -45 + 175 * t_ticks / 65535
+    # 습도 계산
+    rh_ticks = data[3] * 256 + data[4]
+    hum = -6 + 125 * rh_ticks / 65535
+    hum = max(0, min(100, hum))  # 0~100 범위 제한
+    return temp, hum
+
+
+def read_light():
+    """조도 센서 읽기 (0~100% 정도로 변환)."""
+    raw = light_sensor.read_u16()  # 0~65535
+    light_pct = raw / 65535 * 100
+    return light_pct
+
+
+def measure():
+    """센서 1회 측정. 실패 항목은 None."""
+    temp, hum, light = None, None, None
+    try:
+        t, rh = read_sht40()
+        temp = round(t, 2)
+        hum = round(rh, 2)
+    except Exception as e:
+        print(">>> SHT40 오류:", e)
+    try:
+        light = round(read_light(), 1)
+    except Exception as e:
+        print(">>> 조도 센서 오류:", e)
+    return temp, hum, light
 
 
 def connect_wifi():
-    """WiFi 연결. 지수 백오프로 재시도. 5분 넘으면 reset."""
     wlan = network.WLAN(network.STA_IF)
     wlan.active(True)
+    time.sleep(5)   # 워밍업 더 길게
 
     if wlan.isconnected():
         return wlan
 
-    delay = 2
-    deadline = time.time() + 300  # 5분
-    while not wlan.isconnected():
-        wdt.feed()
-        log("WiFi 연결 시도: {}".format(secrets.WIFI_SSID))
+    for attempt in range(5):
+        feed()
+        print(">>> WiFi 연결 시도", attempt + 1, "/5")
         try:
-            wlan.connect(secrets.WIFI_SSID, secrets.WIFI_PASSWORD)
-        except OSError as e:
-            log("connect 오류: {}".format(e))
+            scan_result = wlan.scan()
+            available = [w[0].decode() for w in scan_result]
+            print(">>> 주변 WiFi 개수:", len(available))
+            print(">>> 주변 WiFi 목록:", available)
+        except Exception as e:
+            print(">>> 스캔 에러:", e)
+            time.sleep(2)
+            continue
 
-        for _ in range(10):
-            wdt.feed()
-            if wlan.isconnected():
-                break
+        # wifi_config에 있는 WiFi 찾기
+        print(">>> 내가 찾는 WiFi:", list(wifi_config.WIFI_NETWORKS.keys()))
+        for ssid, pw in wifi_config.WIFI_NETWORKS.items():
+            if ssid in available:
+                print(">>> 발견! 연결 시도:", ssid)
+                wlan.connect(ssid, pw)
+                for _ in range(15):
+                    feed()
+                    if wlan.isconnected():
+                        print(">>> 연결 성공! IP:", wlan.ifconfig()[0])
+                        return wlan
+                    time.sleep(1)
+                print(">>>", ssid, "연결 실패")
+                wlan.disconnect()
+            else:
+                print(">>>", ssid, "는 주변에 없음")
+
+        print(">>> 이번 시도 실패, 3초 후 재시도")
+        for _ in range(3):
+            feed()
             time.sleep(1)
-
-        if wlan.isconnected():
-            break
-
-        if time.time() > deadline:
-            log("5분 내 연결 실패 → reset")
-            reset()
-
-        log("{}초 후 재시도".format(delay))
-        for _ in range(delay):
-            wdt.feed()
-            time.sleep(1)
-        delay = min(delay * 2, 60)
-
-    log("WiFi 연결됨: IP={}".format(wlan.ifconfig()[0]))
-    return wlan
+    print(">>> WiFi 최종 실패")
+    return None
 
 
-def buffer_append(payload):
-    """전송 실패한 측정값을 flash에 추가 저장."""
+# ===== URL 분해 =====
+def parse_url(url):
+    url = url.split("://", 1)[1]
+    if "/" in url:
+        host, path = url.split("/", 1)
+        return host, "/" + path
+    return url, "/"
+
+
+# ===== HTTPS GET (리다이렉트 처리, 구글 시트용) =====
+def https_get(url):
+    host, path = parse_url(url)
+    s = None
     try:
-        # 라인 수 제한 (오래된 것부터 버림)
+        addr = socket.getaddrinfo(host, 443)[0][-1]
+        s = socket.socket()
+        s.settimeout(15)
+        s.connect(addr)
+        s = ssl.wrap_socket(s, server_hostname=host)
+        request = ("GET " + path + " HTTP/1.1\r\n"
+                   "Host: " + host + "\r\n"
+                   "Connection: close\r\n\r\n")
+        s.write(request.encode())
+        response = b""
+        while True:
+            chunk = s.read(512)
+            if not chunk:
+                break
+            response += chunk
+        return response.decode("utf-8", "ignore")
+    finally:
+        if s:
+            try:
+                s.close()
+            except:
+                pass
+
+
+# ===== 시트로 전송 (한 건) =====
+def send_once(temp, hum, light):
+    try:
+        params = "class={}&temp={}&hum={}&light={}".format(
+            wifi_config.CLASS_ID, temp, hum, light)
+        full_url = wifi_config.SHEET_URL + "?" + params
+        print(">>> 전송 URL:", full_url)   # ← URL 확인
+
+        response = https_get(full_url)
+        status_line = response.split("\r\n", 1)[0]
+        print(">>> 1차 응답:", status_line)
+
+        if "302" in status_line or "301" in status_line or "307" in status_line:
+            new_url = None
+            for line in response.split("\r\n"):
+                if line.lower().startswith("location:"):
+                    new_url = line.split(":", 1)[1].strip()
+                    break
+            print(">>> 리다이렉트 주소:", new_url)   # ← 새 주소 확인!
+
+            if new_url:
+                response2 = https_get(new_url)
+                status_line2 = response2.split("\r\n", 1)[0]
+                print(">>> 2차 응답:", status_line2)
+                # ★ 응답 본문 확인!
+                body2 = response2.split("\r\n\r\n", 1)[-1]
+                print(">>> 2차 본문:", body2[-200:])   # ← 핵심!
+                return "200" in status_line2
+            return False
+        body = response.split("\r\n\r\n", 1)[-1]
+        print(">>> 본문:", body[-200:])
+        return "200" in status_line
+    except Exception as e:
+        print(">>> 전송 실패:", e)
+        return False
+
+
+# ===== 버퍼링 (전송 실패 시 저장) =====
+def buffer_append(temp, hum, light):
+    try:
         try:
             with open(BUFFER_FILE, "r") as f:
                 lines = f.readlines()
         except OSError:
             lines = []
+        payload = {"temp": temp, "hum": hum, "light": light}
         lines.append(json.dumps(payload) + "\n")
         if len(lines) > BUFFER_MAX:
             lines = lines[-BUFFER_MAX:]
         with open(BUFFER_FILE, "w") as f:
             f.writelines(lines)
+        print(">>> 버퍼에 저장 (총", len(lines), "건)")
     except OSError as e:
-        log("buffer 쓰기 실패: {}".format(e))
+        print(">>> 버퍼 쓰기 실패:", e)
 
 
 def buffer_flush():
-    """버퍼링된 측정값을 한 번씩 재전송 시도. 성공하면 파일 비움."""
+    """버퍼에 쌓인 것 재전송. 성공한 건 제거."""
     try:
         with open(BUFFER_FILE, "r") as f:
             lines = f.readlines()
     except OSError:
         return
-
     if not lines:
         return
-
-    log("버퍼 {}건 재전송 시도".format(len(lines)))
+    print(">>> 버퍼", len(lines), "건 재전송 시도")
     survivors = []
     for line in lines:
-        wdt.feed()
+        feed()
         try:
-            payload = json.loads(line)
-            if not send_once(payload, retry=False):
+            p = json.loads(line)
+            if not send_once(p["temp"], p["hum"], p["light"]):
                 survivors.append(line)
         except ValueError:
-            pass  # 깨진 라인 버림
-
+            pass  # 깨진 줄 버림
     try:
         with open(BUFFER_FILE, "w") as f:
             f.writelines(survivors)
@@ -120,77 +250,52 @@ def buffer_flush():
         pass
 
 
-def send_once(payload, retry=True):
-    """payload를 서버에 한 번 전송. 성공하면 True."""
+# ===== 메인 =====
+print(">>> WiFi 연결 시도")
+wlan = connect_wifi()
+if not wlan:
+    print(">>> WiFi 연결 실패! reset")
+    time.sleep(2)
+    reset()
+
+# ★ WiFi 연결 성공 후에 와치독 시작! (8초 → 넉넉하게 늘림)
+from machine import WDT
+# ★ WiFi 연결 성공 후에 와치독 시작!
+wdt = WDT(timeout=8388)  # 피코 최대값 약 8.3초
+print(">>> 와치독 시작!")
+
+print(">>> 측정+전송 루프 시작")
+loop_count = 0
+
+while True:
+    loop_count += 1
     try:
-        r = urequests.post(
-            secrets.SERVER_URL,
-            json=payload,
-            headers={"Content-Type": "application/json"},
-            timeout=5,
-        )
-        ok = 200 <= r.status_code < 300
-        r.close()
-        return ok
-    except Exception as e:
-        log("전송 실패: {}".format(e))
-        return False
+        feed()
+        print(">>> ===== 루프 #" + str(loop_count) + " =====")
 
+        if not wlan.isconnected():
+            print(">>> WiFi 끊김! 재연결")
+            wlan = connect_wifi()
+            if not wlan:
+                reset()
 
-def measure():
-    """센서 1회 측정. 실패하면 None 필드로 반환."""
-    payload = {
-        "node_id": secrets.NODE_ID,
-        "ts": time.time(),
-        "temperature": None,
-        "humidity": None,
-        "light": None,
-    }
-    try:
-        t, rh = sensors.read_sht40()
-        payload["temperature"] = round(t, 2)
-        payload["humidity"] = round(rh, 2)
-    except Exception as e:
-        log("SHT40 오류: {}".format(e))
+        temp, hum, light = measure()
+        print("온도:", temp, "습도:", hum, "조도:", light)
 
-    try:
-        payload["light"] = round(sensors.read_light(), 1)
-    except Exception as e:
-        log("Light 센서 오류: {}".format(e))
-
-    return payload
-
-
-def main():
-    log("부팅: node_id={}".format(secrets.NODE_ID))
-    # sensors.scan()이 이제 hex 문자열 리스트(['0x44'])를 그대로 반환하므로
-    # 추가로 hex() 변환하지 않습니다.
-    log("I2C 스캔: {} (0x44 = SHT40 하나만 보이면 정상)".format(sensors.scan()))
-
-    connect_wifi()
-
-    while True:
-        wdt.feed()
-
-        payload = measure()
-        log("측정: T={} RH={} light={}%".format(
-            payload["temperature"], payload["humidity"], payload["light"]))
-
-        if send_once(payload):
-            buffer_flush()  # 그 동안 쌓인 것도 함께
+        if temp is not None and send_once(temp, hum, light):
+            buffer_flush()  # 그동안 쌓인 것도 전송
         else:
-            buffer_append(payload)
-            # WiFi 자체가 끊겼을 가능성 → 재연결
-            wlan = network.WLAN(network.STA_IF)
-            if not wlan.isconnected():
-                connect_wifi()
+            buffer_append(temp, hum, light)
 
-        # INTERVAL만큼 대기 (WDT 피드하면서)
-        elapsed = 0
-        while elapsed < secrets.INTERVAL_SEC:
-            wdt.feed()
-            time.sleep(1)
-            elapsed += 1
+    except Exception as e:
+        print(">>> 루프 에러:", e)
 
+    gc.collect()
 
-main()
+    # INTERVAL 대기 (와치독 feed 하면서!)
+    print(">>>", INTERVAL_SEC, "초 대기...")
+    elapsed = 0
+    while elapsed < INTERVAL_SEC:
+        feed()
+        time.sleep(1)
+        elapsed += 1
