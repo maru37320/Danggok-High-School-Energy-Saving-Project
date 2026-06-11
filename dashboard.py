@@ -1,19 +1,42 @@
-# !!!!!!!아직 수정 전이에요!!!!! 
-# !!!!!!!아직 수정 전이에요!!!!! 
-# !!!!!!!아직 수정 전이에요!!!!! 
+# 수정 완료 했습니다!! 사용가능! 6월 12일 업데이트!
 
 import streamlit as st
 import pandas as pd
 import plotly.express as px
 from datetime import datetime, time as dtime, timedelta
+import concurrent.futures
 
-SHEET_CSV = "https://docs.google.com/spreadsheets/d/1upDHGAi-83NMU4Mo_BuE3E6MeeBoonaemNNWhLZ0i8E/export?format=csv&gid=0"
+# 스프레드시트 ID (export URL의 공통 부분)
+SHEET_ID = "1upDHGAi-83NMU4Mo_BuE3E6MeeBoonaemNNWhLZ0i8E"
+
+# 16개 반의 gid
+CLASS_GIDS = {
+    "1-1": 0,
+    "1-2": 1017758904,
+    "1-3": 973826408,
+    "1-4": 183323741,
+    "1-5": 994373221,
+    "1-6": 1411836865,
+    "1-7": 1000209340,
+    "1-8": 1363114437,
+    "2-1": 687597777,
+    "2-2": 1292185876,
+    "2-3": 87037480,
+    "2-4": 1451071089,
+    "2-5": 1396217133,
+    "2-6": 183824350,
+    "2-7": 402481128,
+    "2-8": 296245463,
+}
+
+def csv_url(gid):
+    return f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv&gid={gid}"
 
 st.set_page_config(page_title="교실 에너지 모니터링", page_icon="🌍", layout="wide")
 
 try:
     from streamlit_autorefresh import st_autorefresh
-    st_autorefresh(interval=30 * 1000, key="refresh")
+    st_autorefresh(interval=15 * 1000, key="refresh")   # 15초
 except ImportError:
     pass
 
@@ -174,7 +197,7 @@ TIMETABLE = {
         "금": {"1교시":"선택 과목","2교시":"선택 과목","3교시":"문학D","4교시":"스생B","5교시":"자율","6교시":"자율"},
     },
 }
-MOVING_SUBJECTS = ["스포츠 생활A", "스포츠 생활B"]
+MOVING_SUBJECTS = ["스생A", "스생B", "합주", "과탐실","미술","체육A","체육B","음악","통과D","정보A","정보B"]
 
 
 # ========================================
@@ -225,18 +248,37 @@ def get_subject(class_id, now, slot_name):
     day = WEEKDAY_KR[weekday]
     return TIMETABLE.get(class_id, {}).get(day, {}).get(slot_name, None)
 
-
-@st.cache_data(ttl=20)
+@st.cache_data(ttl=15)   # 짧게
 def load_data():
-    df = pd.read_csv(SHEET_CSV)
-    df.columns = ["시간", "반", "co2", "온도", "습도", "가스", "조도", "상태"]
-    for col in ["co2", "온도", "습도", "가스"]:
+    def read_one(item):
+        class_id, gid = item
+        try:
+            sheet = pd.read_csv(csv_url(gid))
+            if len(sheet) == 0:
+                return None
+            sheet.columns = ["시간", "반", "온도", "습도", "조도", "상태"]
+            return sheet
+        except Exception:
+            return None
+
+    all_dfs = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=16) as ex:
+        results = ex.map(read_one, CLASS_GIDS.items())
+        for r in results:
+            if r is not None:
+                all_dfs.append(r)
+
+    if not all_dfs:
+        return pd.DataFrame(columns=["시간","반","온도","습도","조도","상태","datetime"])
+
+    df = pd.concat(all_dfs, ignore_index=True)
+    for col in ["온도", "습도", "조도"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
     df["datetime"] = df["시간"].apply(parse_time)
+    df = df[df["상태"] == "정상"]
     return df
 
 df = load_data()
-
 
 def is_active(last_time_str, now, threshold_min=3):
     t = parse_time(last_time_str)
@@ -246,24 +288,45 @@ def is_active(last_time_str, now, threshold_min=3):
     return diff <= threshold_min
 
 
-def check_status(temp, co2, class_id, now):
-    if pd.isna(temp):
+# ===== 상태 판단 기준값 =====
+LIGHT_ON = 20  # 조도 ≥ 20
+TEMP_COLD = 23 # 온도 < 23
+TEMP_HOT = 29  # 온도 ≥ 29
+
+
+def check_status(temp, light, class_id, now):
+    """온도 + 조도 + 시간표로 상태 판단."""
+    if temp is None or pd.isna(temp):
         return "❓ 측정실패", "데이터 없음", "gray"
+
+    people = (light is not None) and (not pd.isna(light)) and (light >= LIGHT_ON)
+
     slot_name, kind = get_current_slot(now)
     subject = get_subject(class_id, now, slot_name)
-    people = co2 >= 600
-    if subject in MOVING_SUBJECTS and temp < 24:
-        return "🔴 이동수업 냉방 낭비!", f"{subject} 시간인데 냉방 켜둠", "red"
-    if temp >= 29:
+
+    # ===== 이동수업일 때 (교실 비어야 정상) =====
+    if subject in MOVING_SUBJECTS:
+        # 1) 이동수업인데 불 켜짐 → 조명 낭비! (NEW)
+        if people:
+            return "🔴 이동수업 조명 낭비!", f"{subject} 시간인데 불 켜둠", "red"
+        # 2) 이동수업인데 냉방 켜둠 → 냉방 낭비
+        if temp < TEMP_COLD:
+            return "🔴 이동수업 냉방 낭비!", f"{subject} 시간인데 냉방 켜둠", "red"
+
+    # 온도 높음 → 냉방 안 함
+    if temp >= TEMP_HOT:
         return "⚪ 냉방 안 함", "온도 높음", "orange"
-    elif temp < 22:
+
+    # 온도 낮음
+    elif temp < TEMP_COLD:
         if not people:
-            return "🟡 빈 교실 냉방 의심", "사람 없는데 냉방", "gold"
+            return "🟡 빈 교실 냉방 의심", "불 꺼졌는데 냉방 중", "gold"
         else:
             return "🔴 과냉방 (낭비!)", "온도 너무 낮음", "red"
+
+    # 적정
     else:
         return "🟢 정상", "적정 온도", "green"
-
 
 COLOR_HEX = {"green":"#2e7d32","red":"#c62828","gold":"#f9a825","orange":"#ef6c00","gray":"#757575"}
 
@@ -273,41 +336,27 @@ COLOR_HEX = {"green":"#2e7d32","red":"#c62828","gold":"#f9a825","orange":"#ef6c0
 # ========================================
 def energy_score_today(class_id, df_class_today, now):
     """
-    [배점] 온도적정(35)+환기(20)+이동수업(20)+빈교실(15)+안정성(10) = 100
+    [배점 1000점] 온도적정(300)+이동수업(250)+빈교실(250)+안정성(200)
     """
     detail = {}
     if df_class_today["온도"].notna().sum() == 0:
         return 0, {"데이터없음": 0}
 
     temps = df_class_today["온도"].dropna()
-    co2s = df_class_today["co2"].dropna()
     avg_temp = temps.mean()
-    avg_co2 = co2s.mean() if len(co2s) else 9999
 
-    # 1) 온도 적정성 (35점)
+    # 1) 온도 적정성 (300점)
     if 24 <= avg_temp <= 26:
-        t_score = 35
+        t_score = 300
     elif avg_temp < 24:
-        t_score = max(0, 35 - (24 - avg_temp) * 9)   # 과냉방 강하게 감점
+        t_score = max(0, 300 - (24 - avg_temp) * 70)   # 과냉방 감점
     else:
-        t_score = max(0, 35 - (avg_temp - 26) * 5)
-    detail["🌡️온도적정"] = round(t_score, 1)
+        t_score = max(0, 300 - (avg_temp - 26) * 40)
+    t_score = round(t_score, 1)
+    detail["🌡️온도적정"] = t_score
 
-    # 2) 환기 관리 (20점)
-    if avg_co2 <= 800:
-        v_score = 20
-    elif avg_co2 <= 1000:
-        v_score = 16
-    elif avg_co2 <= 1500:
-        v_score = 10
-    elif avg_co2 <= 2000:
-        v_score = 5
-    else:
-        v_score = 0
-    detail["🫁환기"] = round(v_score, 1)
-
-    # 3) 이동수업 절약 (20점)
-    move_score = 20
+    # 2) 이동수업 절약 (250점) — 이동수업인데 냉방 켜둠 감점
+    move_score = 250
     move_total = 0; move_waste = 0
     weekday = now.weekday()
     if weekday < 5:
@@ -322,37 +371,37 @@ def energy_score_today(class_id, df_class_today, now):
                     subj = TIMETABLE.get(class_id, {}).get(day, {}).get(name)
                     if subj in MOVING_SUBJECTS:
                         move_total += 1
-                        if drow["온도"] < 24:
+                        if drow["온도"] < TEMP_COLD:   # 추운데 냉방 켜둠
                             move_waste += 1
                     break
         if move_total > 0:
-            move_score = round(20 * (1 - move_waste / move_total), 1)
+            move_score = round(250 * (1 - move_waste / move_total), 1)
     detail["🚶이동수업"] = move_score
 
-    # 4) 빈 교실 절약 (15점)
+    # 3) 빈 교실 절약 (250점) — 불 꺼졌는데(조도 낮음) 냉방 중이면 감점
     empty_total = 0; empty_waste = 0
     for _, drow in df_class_today.iterrows():
-        if pd.isna(drow["온도"]) or pd.isna(drow["co2"]):
+        if pd.isna(drow["온도"]) or pd.isna(drow["조도"]):
             continue
-        if drow["co2"] < 600:
+        if drow["조도"] < LIGHT_ON:   # 불 꺼짐 = 빈 교실 추정
             empty_total += 1
-            if drow["온도"] < 22:
+            if drow["온도"] < TEMP_COLD:   # 빈 교실인데 추움(냉방 중)
                 empty_waste += 1
-    empty_score = round(15 * (1 - empty_waste / empty_total), 1) if empty_total > 0 else 15
+    empty_score = round(250 * (1 - empty_waste / empty_total), 1) if empty_total > 0 else 250
     detail["🪑빈교실"] = empty_score
 
-    # 5) 온도 안정성 (10점)
+    # 4) 온도 안정성 (200점)
     if len(temps) >= 3:
         std = temps.std()
-        if std <= 1: s_score = 10
-        elif std <= 2: s_score = 7
-        elif std <= 3: s_score = 4
+        if std <= 1: s_score = 200
+        elif std <= 2: s_score = 140
+        elif std <= 3: s_score = 80
         else: s_score = 0
     else:
-        s_score = 10
+        s_score = 200
     detail["📉안정성"] = round(s_score, 1)
 
-    total = round(max(0, min(100, t_score + v_score + move_score + empty_score + s_score)), 1)
+    total = round(max(0, min(1000, t_score + move_score + empty_score + s_score)), 1)
     return total, detail
 
 
@@ -479,15 +528,34 @@ st.markdown("""
 .cc-reason{font-size:13px;margin-bottom:10px;}
 .cc-data{font-size:15px;font-weight:600;background:rgba(0,0,0,0.25);border-radius:12px;padding:8px 10px;}
 
-.tt-table{width:100%;border-collapse:collapse;background:rgba(13,71,161,0.85);
-    border-radius:14px;overflow:hidden;border:3px solid #0d3b66;}
-.tt-table th{background:#0d47a1;padding:14px;border:1px solid #0d3b66;}
-.tt-table td{padding:13px;text-align:center;font-weight:700;border:1px solid #2a5a9a;}
-.tt-period{background:rgba(13,71,161,0.6);font-weight:900;}
-.tt-now td{background:#ef6c00 !important;}
-.tt-break td{background:rgba(0,0,0,0.3);font-size:13px;}
-.tt-lunch td{background:rgba(245,127,23,0.6);font-weight:900;}
-.tt-home td{background:rgba(46,125,50,0.6);font-weight:900;}
+.tt-table{width:100%;border-collapse:separate;border-spacing:0 8px;}
+.tt-table th{background:#6d4c41;
+    padding:16px;font-size:19px;font-weight:900;border:none;border-radius:12px;}
+.tt-row td{background:#f5ece3;
+    color:#4e342e !important;text-shadow:none !important;
+    padding:16px 20px;font-size:20px;font-weight:800;
+    border:none;vertical-align:middle;}
+.tt-row td:first-child{border-radius:12px 0 0 12px;}
+.tt-row td:last-child{border-radius:0 12px 12px 0;text-align:right;
+    font-size:15px;font-weight:700;color:#8d6e63 !important;}
+.tt-subject{font-size:22px;font-weight:900;}
+.tt-period-label{font-size:14px;opacity:0.65;font-weight:700;}
+
+/* 쉬는시간 - 더 연하게 */
+.tt-break td{background:#efebe9 !important;
+    color:#795548 !important;font-size:16px;padding:10px 20px;}
+/* 점심 - 살짝 진하게 */
+.tt-lunch td{background:#e0c9a6 !important;
+    color:#4e342e !important;font-size:20px;}
+/* 조종례 - 중간 톤 */
+.tt-home td{background:#e8dcc8 !important;
+    color:#4e342e !important;}
+/* 현재 교시 - 같은 계열 진한 톤 + 부드러운 그림자 */
+.tt-now td{background:#a1887f !important;
+    color:#ffffff !important;box-shadow:0 4px 14px rgba(109,76,65,0.45);}
+/* 이동수업 - 같은 계열 + 왼쪽 띠로만 잔잔히 강조 */
+.tt-move td{background:#e0c9a6 !important;color:#4e342e !important;}
+.tt-move td:first-child{border-left:6px solid #8d6e63;border-radius:12px 0 0 12px;}
 
 /* ===== 프로젝트 목표 페이지 ===== */
 .goal-main{background:linear-gradient(135deg,#1565c0,#42a5f5,#26c6da);
@@ -514,6 +582,14 @@ st.markdown("""
 .flow-step{text-align:center;flex:1;min-width:110px;}
 .flow-step .fi{font-size:46px;}
 .flow-arrow{font-size:38px;}
+.chart-box {
+    background: rgba(13, 71, 161, 0.55);
+    border-radius: 22px;
+    padding: 14px;
+    margin-bottom: 18px;
+    box-shadow: 0 6px 20px rgba(0,0,0,0.25);
+    border: 1px solid rgba(255,255,255,0.15);
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -565,39 +641,51 @@ def date_range_picker(df_source, key_prefix):
 if page == "🏠 대시보드 홈":
     st.markdown(render_clock(now, slot_name, slot_kind), unsafe_allow_html=True)
     st.title("🏠 전체 교실 현황")
-    latest = df.groupby("반").last().reset_index()
-    total = len(latest)
-    waste = sum(1 for _,r in latest.iterrows() if check_status(r["온도"],r["co2"],r["반"],now)[2] in ["red","gold"])
-    normal = sum(1 for _,r in latest.iterrows() if check_status(r["온도"],r["co2"],r["반"],now)[2]=="green")
-    c1,c2,c3 = st.columns(3)
-    c1.metric("📊 측정 중인 반", f"{total}개")
-    c2.metric("🟢 정상", f"{normal}개")
-    c3.metric("🔴 낭비 의심", f"{waste}개")
-    st.divider()
-    st.subheader("⚡ 반별 상태")
-    rows=[latest[i:i+4] for i in range(0,len(latest),4)]
-    for rg in rows:
-        cols=st.columns(4)
-        for idx,(_,row) in enumerate(rg.iterrows()):
-            status,reason,color=check_status(row["온도"],row["co2"],row["반"],now)
-            subject=get_subject(row["반"],now,slot_name)
-            subject_text=f"📖 {subject} · {slot_name}" if subject else f"🕐 {slot_name}"
-            bg=COLOR_HEX.get(color,"#757575")
-            active=is_active(row["시간"],now)
-            if active is True:
-                ah='<span class="cc-active" style="background:#43a047;">🟢 작동함</span>'
-            elif active is False:
-                ah='<span class="cc-active" style="background:#c62828;">🔴 작동 안함</span>'
-            else:
-                ah='<span class="cc-active" style="background:#757575;">⚪ 알수없음</span>'
-            with cols[idx]:
-                st.markdown(f"""<div class="class-card" style="background:{bg};">
-                <p class="cc-name">{row['반']}</p>
-                <p class="cc-subject">{subject_text}</p>{ah}
-                <p class="cc-status">{status}</p>
-                <p class="cc-reason">{reason}</p>
-                <div class="cc-data">🌡️ {row['온도']}°C &nbsp; 🫁 {row['co2']}ppm<br>
-                💧 {row['습도']}% &nbsp; 🔥 가스 {row['가스']}</div></div>""", unsafe_allow_html=True)
+
+    if len(df) == 0:
+        st.warning("아직 수집된 데이터가 없어요. (정상 데이터 기준)")
+    else:
+        latest = df.groupby("반").last().reset_index()
+        total = len(latest)
+        waste = sum(1 for _, r in latest.iterrows()
+                    if check_status(r["온도"], r["조도"], r["반"], now)[2] in ["red", "gold"])
+        normal = sum(1 for _, r in latest.iterrows()
+                     if check_status(r["온도"], r["조도"], r["반"], now)[2] == "green")
+        c1, c2, c3 = st.columns(3)
+        c1.metric("📊 측정 중인 반", f"{total}개")
+        c2.metric("🟢 정상", f"{normal}개")
+        c3.metric("🔴 낭비 의심", f"{waste}개")
+        st.divider()
+        st.subheader("⚡ 반별 상태")
+        rows = [latest[i:i+4] for i in range(0, len(latest), 4)]
+        for rg in rows:
+            cols = st.columns(4)
+            for idx, (_, row) in enumerate(rg.iterrows()):
+                status, reason, color = check_status(row["온도"], row["조도"], row["반"], now)
+                subject = get_subject(row["반"], now, slot_name)
+                subject_text = f"📖 {subject} · {slot_name}" if subject else f"🕐 {slot_name}"
+                bg = COLOR_HEX.get(color, "#757575")
+                active = is_active(row["시간"], now)
+                if active is True:
+                    ah = '<span class="cc-active" style="background:#43a047;">🟢 작동함</span>'
+                elif active is False:
+                    ah = '<span class="cc-active" style="background:#c62828;">🔴 작동 안함</span>'
+                else:
+                    ah = '<span class="cc-active" style="background:#757575;">⚪ 알수없음</span>'
+                # 조도로 불 켜짐/꺼짐 표시
+                light_val = row["조도"]
+                if pd.notna(light_val) and light_val >= LIGHT_ON:
+                    light_text = f"💡 {light_val} (켜짐)"
+                else:
+                    light_text = f"🌑 {light_val} (꺼짐)"
+                with cols[idx]:
+                    st.markdown(f"""<div class="class-card" style="background:{bg};">
+                    <p class="cc-name">{row['반']}</p>
+                    <p class="cc-subject">{subject_text}</p>{ah}
+                    <p class="cc-status">{status}</p>
+                    <p class="cc-reason">{reason}</p>
+                    <div class="cc-data">🌡️ {row['온도']}°C &nbsp; 💧 {row['습도']}%<br>
+                    {light_text}</div></div>""", unsafe_allow_html=True)
 
 
 # ========================================
@@ -605,63 +693,170 @@ if page == "🏠 대시보드 홈":
 # ========================================
 elif page == "📊 반별 상세":
     st.title("📊 반별 상세 그래프")
-    class_list=sorted(df["반"].unique().tolist())
-    selected=st.selectbox("반을 선택하세요", class_list)
-
-    class_all = df[df["반"]==selected].copy()
-    class_df, sdt, edt = date_range_picker(class_all, "detail_")
-    class_df = class_df.sort_values("datetime")
-
-    if len(class_df)==0:
-        st.warning("선택한 범위에 데이터가 없어요. 범위를 조정해보세요.")
+    if len(df) == 0:
+        st.warning("아직 수집된 데이터가 없어요.")
     else:
-        latest_row=class_df.iloc[-1]
-        status,reason,color=check_status(latest_row["온도"],latest_row["co2"],selected,now)
-        subject=get_subject(selected,now,slot_name)
-        st.markdown(f"## {selected}반 — {status}")
-        st.caption(f"{reason} · 현재: {subject or slot_name} · "
-                   f"{sdt.strftime('%m/%d %H:%M')} ~ {edt.strftime('%m/%d %H:%M')} / {len(class_df)}개")
+        class_list = sorted(df["반"].unique().tolist())
+        selected = st.selectbox("반을 선택하세요", class_list, key="detail_class")
 
-        c1,c2,c3,c4=st.columns(4)
-        c1.metric("🫁 CO₂", f"{latest_row['co2']} ppm")
-        c2.metric("🌡️ 온도", f"{latest_row['온도']} °C")
-        c3.metric("💧 습도", f"{latest_row['습도']} %")
-        c4.metric("🔥 가스", f"{latest_row['가스']}")
-        st.divider()
+        class_all = df[df["반"] == selected].copy()
+        class_df, sdt, edt = date_range_picker(class_all, "detail_")
+        class_df = class_df.sort_values("datetime")
 
-        def make_chart(y_col, title, color):
-            fig=px.line(class_df, x="datetime", y=y_col, title=title, markers=True)
-            fig.update_traces(line_color=color, line_width=3,
-                marker=dict(size=7,color=color,line=dict(width=1.5,color="white")),
-                hovertemplate="<b>%{x|%m/%d %H:%M:%S}</b><br>"+y_col+": %{y}<extra></extra>")
-            fig.update_layout(
-                plot_bgcolor="rgba(255,255,255,0.95)",
-                paper_bgcolor="rgba(13,71,161,0.55)",
-                font_color="#fff", title_font_color="#fff", title_font_size=18,
-                xaxis_title="시각", margin=dict(l=20,r=20,t=50,b=20), height=300,
-                hoverlabel=dict(bgcolor="white", font_size=14))
-            fig.update_xaxes(gridcolor="rgba(13,59,94,0.15)", color="#fff",
-                tickfont_color="#fff", title_font_color="#fff")
-            fig.update_yaxes(gridcolor="rgba(13,59,94,0.15)", color="#fff",
-                tickfont_color="#fff", title_font_color="#fff")
-            return fig
+        if len(class_df) == 0:
+            st.warning("선택한 범위에 데이터가 없어요. 범위를 조정해보세요.")
+        else:
+            latest_row = class_df.iloc[-1]
+            status, reason, color = check_status(latest_row["온도"], latest_row["조도"], selected, now)
+            subject = get_subject(selected, now, slot_name)
+            st.markdown(f"## {selected}반 — {status}")
+            st.caption(f"{reason} · 현재: {subject or slot_name} · "
+                       f"{sdt.strftime('%m/%d %H:%M')} ~ {edt.strftime('%m/%d %H:%M')} / {len(class_df)}개")
 
-        col1,col2=st.columns(2)
-        with col1:
-            st.plotly_chart(make_chart("co2","🫁 CO₂ 변화","#e53935"), use_container_width=True)
-            st.plotly_chart(make_chart("온도","🌡️ 온도 변화","#00897b"), use_container_width=True)
-        with col2:
-            st.plotly_chart(make_chart("습도","💧 습도 변화","#1e88e5"), use_container_width=True)
-            st.plotly_chart(make_chart("가스","🔥 가스 변화","#fb8c00"), use_container_width=True)
+            # 불 켜짐/꺼짐
+            light_val = latest_row["조도"]
+            light_state = "💡 켜짐" if (pd.notna(light_val) and light_val >= LIGHT_ON) else "🌑 꺼짐"
 
+            c1, c2, c3 = st.columns(3)
+            c1.metric("🌡️ 온도", f"{latest_row['온도']} °C")
+            c2.metric("💧 습도", f"{latest_row['습도']} %")
+            c3.metric("💡 조도", f"{latest_row['조도']} ({light_state})")
+            st.divider()
+            
+            # 그래프 공통 스타일 적용 함수
+            def _style_chart(fig, title, color):
+                fig.update_layout(
+                    plot_bgcolor="rgba(255,255,255,0.97)",
+                    paper_bgcolor="rgba(0,0,0,0)",
+                    font=dict(color="#ffffff", size=15, family="Arial Black, Arial, sans-serif"),
+                    title=dict(text=title, font=dict(color="#ffffff", size=22,
+                               family="Arial Black, Arial, sans-serif",
+                               shadow="2px 2px 3px black, -2px -2px 3px black, 2px -2px 3px black, -2px 2px 3px black")),
+                    xaxis_title="시각", margin=dict(l=20, r=20, t=55, b=20), height=320,
+                    hoverlabel=dict(bgcolor="white",
+                                    font=dict(color="black", size=15, family="Arial, sans-serif"),
+                                    bordercolor=color))
+                shadow4 = "1px 1px 2px black, -1px -1px 2px black, 1px -1px 2px black, -1px 1px 2px black"
+                fig.update_xaxes(gridcolor="rgba(13,59,94,0.18)", color="#ffffff",
+                    tickfont=dict(color="#ffffff", size=13, shadow=shadow4),
+                    title_font=dict(color="#ffffff", size=15, shadow=shadow4),
+                    linecolor="#ffffff", linewidth=2)
+                fig.update_yaxes(gridcolor="rgba(13,59,94,0.18)", color="#ffffff",
+                    tickfont=dict(color="#ffffff", size=13, shadow=shadow4),
+                    title_font=dict(color="#ffffff", size=15, shadow=shadow4),
+                    linecolor="#ffffff", linewidth=2)
+                return fig
 
+            def make_chart(y_col, title, color):
+                fig = px.line(class_df, x="datetime", y=y_col, title=title, markers=True)
+                # 선 굵게 + 마커 크게
+                fig.update_traces(
+                    line_color=color,
+                    line_width=5,   # ← 선 굵기 (3 → 5)
+                    marker=dict(size=10, color=color,
+                                line=dict(width=2.5, color="white")),  # 마커 테두리 흰색
+                    hovertemplate="<b>%{x|%m/%d %H:%M:%S}</b><br>" + y_col + ": <b>%{y}</b><extra></extra>"
+                )
+                fig.update_layout(
+                    plot_bgcolor="rgba(255,255,255,0.97)",
+                    paper_bgcolor="rgba(0,0,0,0)",
+                    font=dict(color="#ffffff", size=15,
+                              family="Arial Black, Arial, sans-serif"),
+                    title=dict(
+                        text=title,
+                        font=dict(color="#ffffff", size=22,
+                                  family="Arial Black, Arial, sans-serif",
+                                  shadow="2px 2px 3px black, -2px -2px 3px black, 2px -2px 3px black, -2px 2px 3px black")  # ★ 제목 사방 그림자
+                    ),
+                    xaxis_title="시각",
+                    margin=dict(l=20, r=20, t=55, b=20),
+                    height=320,
+                    hoverlabel=dict(
+                        bgcolor="white",
+                        font=dict(color="black", size=15,
+                                  family="Arial, sans-serif"),  # ★ Arial Black → Arial
+                        bordercolor=color
+                    )
+                )
+                # 축 글씨 — 사방 그림자로 진하게
+                fig.update_xaxes(
+                    gridcolor="rgba(13,59,94,0.18)",
+                    color="#ffffff",
+                    tickfont=dict(color="#ffffff", size=13,
+                                  shadow="1px 1px 2px black, -1px -1px 2px black, 1px -1px 2px black, -1px 1px 2px black"),  # ★
+                    title_font=dict(color="#ffffff", size=15,
+                                    shadow="1px 1px 2px black, -1px -1px 2px black, 1px -1px 2px black, -1px 1px 2px black"),  # ★
+                    linecolor="#ffffff", linewidth=2
+                )
+                fig.update_yaxes(
+                    gridcolor="rgba(13,59,94,0.18)",
+                    color="#ffffff",
+                    tickfont=dict(color="#ffffff", size=13,
+                                  shadow="1px 1px 2px black, -1px -1px 2px black, 1px -1px 2px black, -1px 1px 2px black"),  # ★
+                    title_font=dict(color="#ffffff", size=15,
+                                    shadow="1px 1px 2px black, -1px -1px 2px black, 1px -1px 2px black, -1px 1px 2px black"),  # ★
+                    linecolor="#ffffff", linewidth=2
+                )
+                return fig
+
+            # 그래프를 둥근 카드 안에 넣기
+            def chart_card(fig):
+                st.markdown('<div class="chart-box">', unsafe_allow_html=True)
+                st.plotly_chart(fig, use_container_width=True)
+                st.markdown('</div>', unsafe_allow_html=True)
+
+            # ===== 온도 그래프 (낭비 시점 빨강으로 색칠) =====
+            import plotly.graph_objects as go
+
+            # 각 점의 낭비 여부 판단 → 색 결정
+            temp_colors = []
+            for _, r in class_df.iterrows():
+                pt_time = r["datetime"]
+                _, _, c = check_status(r["온도"], r["조도"], selected, pt_time)
+                temp_colors.append("#e53935" if c in ["red", "gold"] else "#00897b")
+
+            fig_temp = go.Figure()
+            fig_temp.add_trace(go.Scatter(
+                x=class_df["datetime"], y=class_df["온도"],
+                mode="lines+markers",
+                line=dict(color="#00897b", width=5),
+                marker=dict(size=11, color=temp_colors, line=dict(width=2.5, color="white")),
+                hovertemplate="<b>%{x|%m/%d %H:%M:%S}</b><br>온도: <b>%{y}</b>°C<extra></extra>"
+            ))
+            _style_chart(fig_temp, "🌡️ 온도 변화 (🔴=낭비 의심)", "#00897b")
+
+            # ===== 조도 그래프 (이동수업 중 불 켜진 시점 빨강으로) =====
+            light_colors = []
+            for _, r in class_df.iterrows():
+                pt_time = r["datetime"]
+                _, _, c = check_status(r["온도"], r["조도"], selected, pt_time)
+                # 조명 낭비(이동수업+불켜짐)일 때만 빨강
+                slot_n, _ = get_current_slot(pt_time)
+                subj = get_subject(selected, pt_time, slot_n)
+                is_light_waste = (subj in MOVING_SUBJECTS) and pd.notna(r["조도"]) and (r["조도"] >= LIGHT_ON)
+                light_colors.append("#e53935" if is_light_waste else "#fbc02d")
+
+            fig_light = go.Figure()
+            fig_light.add_trace(go.Scatter(
+                x=class_df["datetime"], y=class_df["조도"],
+                mode="lines+markers",
+                line=dict(color="#fbc02d", width=5),
+                marker=dict(size=11, color=light_colors, line=dict(width=2.5, color="white")),
+                hovertemplate="<b>%{x|%m/%d %H:%M:%S}</b><br>조도: <b>%{y}</b><extra></extra>"
+            ))
+            _style_chart(fig_light, "💡 조도 변화 (🔴=이동수업 중 불 켜짐)", "#fbc02d")
+
+            # 그래프 출력 (온도 → 습도 → 조도)
+            chart_card(fig_temp)
+            chart_card(make_chart("습도", "💧 습도 변화", "#1e88e5"))
+            chart_card(fig_light)
 # ========================================
 # 페이지 3: 에너지 랭킹 (오늘 하루, 등급 없음)
 # ========================================
 elif page == "🏆 에너지 랭킹":
     st.title("🏆 오늘의 에너지 절약 랭킹")
     st.caption(f"📅 {now.strftime('%Y년 %m월 %d일')} 집계 (매일 0시 초기화)")
-    st.caption("온도적정(35)+환기(20)+이동수업(20)+빈교실(15)+안정성(10) = 100점")
+    st.caption("온도적정(300)+이동수업(250)+빈교실(250)+안정성(200) = 1000점")
 
     today = now.date()
     df_today = df[df["datetime"].notna()].copy()
@@ -680,46 +875,64 @@ elif page == "🏆 에너지 랭킹":
 
         for idx,(class_id,sc,detail,latest) in enumerate(results):
             medal=["🥇","🥈","🥉"][idx] if idx<3 else f"{idx+1}위"
-            status,reason,color=check_status(latest["온도"],latest["co2"],class_id,now)
+            status,reason,color=check_status(latest["온도"],latest["조도"],class_id,now)
             bg=COLOR_HEX.get(color,"#757575")
             detail_str=" · ".join(f"{k} {v}" for k,v in detail.items())
+            # 불 켜짐/꺼짐
+            light_val = latest["조도"]
+            light_txt = "💡켜짐" if (pd.notna(light_val) and light_val >= LIGHT_ON) else "🌑꺼짐"
             st.markdown(f"""<div class="class-card" style="background:{bg};">
                 <div style="display:flex;align-items:center;">
                 <div style="font-size:44px;margin-right:20px;">{medal}</div>
                 <div style="flex:1;">
                 <p class="cc-name">{class_id} — {sc}점</p>
                 <p class="cc-status">{status}</p>
-                <p class="cc-reason">🌡️ 현재 {latest['온도']}°C · 🫁 {latest['co2']}ppm</p>
+                <p class="cc-reason">🌡️ 현재 {latest['온도']}°C · {light_txt}</p>
                 <div class="cc-data">{detail_str}</div>
                 </div></div></div>""", unsafe_allow_html=True)
-
 
 # ========================================
 # 페이지 4: 시간표
 # ========================================
 elif page == "📅 오늘의 시간표":
     st.title("📅 오늘의 시간표")
-    selected=st.selectbox("반 선택", sorted(TIMETABLE.keys()))
-    weekday=now.weekday()
-    if weekday>=5:
+    selected = st.selectbox("반 선택", sorted(TIMETABLE.keys()))
+    weekday = now.weekday()
+    if weekday >= 5:
         st.info("🌴 주말입니다! 시간표가 없어요.")
     else:
-        day=WEEKDAY_KR[weekday]
+        day = WEEKDAY_KR[weekday]
         st.subheader(f"{selected}반 · {day}요일")
-        schedule=DAY_SCHEDULE[weekday]
-        html='<table class="tt-table"><tr><th>구분</th><th>시간</th><th>과목/내용</th></tr>'
-        for name,start,end,kind in schedule:
-            subject=TIMETABLE.get(selected,{}).get(day,{}).get(name,"")
-            time_str=f"{start.strftime('%H:%M')} ~ {end.strftime('%H:%M')}"
-            is_now=(start<=now.time()<end)
-            rc={"break":"tt-break","lunch":"tt-lunch","homeroom":"tt-home"}.get(kind,"")
-            if is_now: rc+=" tt-now"
-            tag=" 🔴" if is_now else ""
-            disp=subject if subject else name
-            html+=f'<tr class="{rc}"><td class="tt-period">{name}{tag}</td><td>{time_str}</td><td>{disp}</td></tr>'
-        html+='</table>'
-        st.markdown(html, unsafe_allow_html=True)
+        schedule = DAY_SCHEDULE[weekday]
+        html = '<table class="tt-table"><tr><th>교시 / 과목</th><th>시간</th></tr>'
+        for name, start, end, kind in schedule:
+            subject = TIMETABLE.get(selected, {}).get(day, {}).get(name, "")
+            time_str = f"{start.strftime('%H:%M')} ~ {end.strftime('%H:%M')}"
+            is_now = (start <= now.time() < end)
+            is_move = subject in MOVING_SUBJECTS
 
+            # 행 클래스 결정
+            rc = "tt-row"
+            if kind == "break": rc += " tt-break"
+            elif kind == "lunch": rc += " tt-lunch"
+            elif kind == "homeroom": rc += " tt-home"
+            elif is_move: rc += " tt-move"
+            if is_now: rc += " tt-now"
+
+            # 교시 + 과목 묶어서 표시
+            if "교시" in name:
+                move_icon = " 🏃" if is_move else ""
+                now_icon = " 🔴" if is_now else ""
+                cell = (f'<span class="tt-period-label">{name}</span><br>'
+                        f'<span class="tt-subject">{subject or "-"}{move_icon}</span>{now_icon}')
+            else:
+                # 쉬는시간/점심/조종례는 이름만
+                now_icon = " 🔴" if is_now else ""
+                cell = f'<span class="tt-subject">{name}</span>{now_icon}'
+
+            html += f'<tr class="{rc}"><td>{cell}</td><td>{time_str}</td></tr>'
+        html += '</table>'
+        st.markdown(html, unsafe_allow_html=True)
 
 # ========================================
 # 페이지 5: 에너지 리포트 (범위 선택)
@@ -729,71 +942,127 @@ elif page == "💡 에너지 리포트":
     df_all = df[df["datetime"].notna() & df["온도"].notna()].copy()
     df_valid, sdt, edt = date_range_picker(df_all, "report_")
 
-    if len(df_valid)==0:
+    if len(df_valid) == 0:
         st.warning("선택한 범위에 데이터가 없어요.")
     else:
         st.caption(f"📅 {sdt.strftime('%m/%d %H:%M')} ~ {edt.strftime('%m/%d %H:%M')} / {len(df_valid)}개 분석")
-        c1,c2,c3=st.columns(3)
+        c1, c2, c3 = st.columns(3)
         c1.metric("🌡️ 평균 온도", f"{df_valid['온도'].mean():.1f} °C")
-        c2.metric("🫁 평균 CO₂", f"{df_valid['co2'].mean():.0f} ppm")
+        c2.metric("💡 평균 조도", f"{df_valid['조도'].mean():.0f}")
         c3.metric("💧 평균 습도", f"{df_valid['습도'].mean():.1f} %")
         st.divider()
 
-        layout=dict(plot_bgcolor="rgba(255,255,255,0.95)",
-            paper_bgcolor="rgba(13,71,161,0.55)", font_color="#fff",
-            title_font_color="#fff", margin=dict(l=20,r=20,t=60,b=20))
+        # 그래프 글씨 그림자 (재사용)
+        shadow4 = "1px 1px 2px black, -1px -1px 2px black, 1px -1px 2px black, -1px 1px 2px black"
+        layout = dict(plot_bgcolor="rgba(255,255,255,0.95)",
+            paper_bgcolor="rgba(13,71,161,0.55)",
+            font=dict(color="#fff", shadow=shadow4),
+            margin=dict(l=20, r=20, t=60, b=20))
 
-        st.subheader("⏰ 시간대별 평균 온도 — 언제 냉방을 더 틀었나?")
+        # ===== ① 시간대별 평균 온도 =====
+        st.subheader("⏰ 시간대별 평균 온도")
         df_valid = df_valid.copy()
         df_valid["시각"] = df_valid["datetime"].dt.hour
         hourly = df_valid.groupby("시각")["온도"].mean().reset_index()
-        fig=px.bar(hourly, x="시각", y="온도", text_auto=".1f",
+        fig = px.bar(hourly, x="시각", y="온도", text_auto=".1f",
             color="온도", color_continuous_scale="RdBu_r",
-            labels={"시각":"시간 (시)","온도":"평균 온도(°C)"})
-        fig.update_traces(marker_line_width=2, marker_line_color="#0d3b66", textposition="outside")
+            labels={"시각": "시간 (시)", "온도": "평균 온도(°C)"})
+        fig.update_traces(marker_line_width=2, marker_line_color="#0d3b66", textposition="outside",
+            textfont=dict(color="#fff"))
         fig.add_hline(y=24, line_dash="dash", line_color="lime",
             annotation_text="적정 하한 24도", annotation_font_color="white")
         fig.add_hline(y=26, line_dash="dash", line_color="orange",
             annotation_text="적정 상한 26도", annotation_font_color="white")
-        fig.update_layout(height=380, title="시간대별 평균 온도", **layout)
-        fig.update_xaxes(color="#fff",tickfont_color="#fff",title_font_color="#fff",dtick=1)
-        fig.update_yaxes(color="#fff",tickfont_color="#fff",title_font_color="#fff")
+        fig.update_layout(height=380, title="", **layout)   # ★ 제목 비움
+        fig.update_xaxes(color="#fff", title_font_color="#fff", dtick=1,
+            tickfont=dict(color="#fff", shadow=shadow4), title_font=dict(shadow=shadow4))
+        fig.update_yaxes(color="#fff", title_font_color="#fff",
+            tickfont=dict(color="#fff", shadow=shadow4), title_font=dict(shadow=shadow4))
         st.plotly_chart(fig, use_container_width=True)
 
-        col1,col2=st.columns(2)
+        # ===== ② 온도 상태 비율 / ③ 조도 상태 비율 =====
+        col1, col2 = st.columns(2)
         with col1:
             st.subheader("🌡️ 온도 상태 비율")
             def temp_cat(t):
-                if t<22: return "너무 추움(낭비)"
-                elif t<=28: return "적정"
+                if t < 22: return "너무 추움(낭비)"
+                elif t <= 28: return "적정"
                 else: return "너무 더움"
-            df_valid["상태분류"]=df_valid["온도"].apply(temp_cat)
-            cat=df_valid["상태분류"].value_counts().reset_index()
-            cat.columns=["상태","개수"]
-            fig2=px.pie(cat, names="상태", values="개수", hole=0.5,
+            df_valid["상태분류"] = df_valid["온도"].apply(temp_cat)
+            cat = df_valid["상태분류"].value_counts().reset_index()
+            cat.columns = ["상태", "개수"]
+            fig2 = px.pie(cat, names="상태", values="개수", hole=0.5,
                 color="상태", color_discrete_map={
-                    "적정":"#2e7d32","너무 추움(낭비)":"#1e88e5","너무 더움":"#e53935"})
-            fig2.update_traces(textinfo="percent+label", textfont_color="white",
+                    "적정": "#2e7d32", "너무 추움(낭비)": "#1e88e5", "너무 더움": "#e53935"})
+            fig2.update_traces(textinfo="percent+label",
+                textfont=dict(color="white", shadow=shadow4),   # ★ 그림자
                 marker=dict(line=dict(color="#0d3b66", width=3)))
-            fig2.update_layout(height=350, **layout)
+            fig2.update_layout(height=350, title="", **layout)   # ★ 제목 비움
             st.plotly_chart(fig2, use_container_width=True)
         with col2:
-            st.subheader("🫁 환기 상태 비율")
-            def co2_cat(c):
-                if c<=1000: return "쾌적"
-                elif c<=1500: return "보통"
-                else: return "환기 필요"
-            df_valid["환기분류"]=df_valid["co2"].apply(co2_cat)
-            cat2=df_valid["환기분류"].value_counts().reset_index()
-            cat2.columns=["상태","개수"]
-            fig3=px.pie(cat2, names="상태", values="개수", hole=0.5,
+            st.subheader("💡 조명 상태 비율")
+            def light_cat(l):
+                return "불 켜짐" if l >= LIGHT_ON else "불 꺼짐"
+            df_valid["조명분류"] = df_valid["조도"].apply(light_cat)
+            cat3 = df_valid["조명분류"].value_counts().reset_index()
+            cat3.columns = ["상태", "개수"]
+            fig3 = px.pie(cat3, names="상태", values="개수", hole=0.5,
                 color="상태", color_discrete_map={
-                    "쾌적":"#2e7d32","보통":"#f9a825","환기 필요":"#e53935"})
-            fig3.update_traces(textinfo="percent+label", textfont_color="white",
+                    "불 켜짐": "#fbc02d", "불 꺼짐": "#37474f"})
+            fig3.update_traces(textinfo="percent+label",
+                textfont=dict(color="white", shadow=shadow4),   # ★ 그림자
                 marker=dict(line=dict(color="#0d3b66", width=3)))
-            fig3.update_layout(height=350, **layout)
+            fig3.update_layout(height=350, title="", **layout)   # ★ 제목 비움
             st.plotly_chart(fig3, use_container_width=True)
 
+        st.divider()
+
+        # ===== ④ 이동수업 낭비 분석 =====
+        st.subheader("🚶 이동수업 중 에너지 낭비 분석")
+        st.caption("이동수업(교실 비움)인데 불을 켜뒀거나 냉방을 켜둔 비율")
+
+        move_ok = 0; move_light = 0; move_cool = 0
+        for _, r in df_valid.iterrows():
+            dt = r["datetime"]
+            slot_n, _ = get_current_slot(dt)
+            subj = get_subject(r["반"], dt, slot_n)
+            if subj in MOVING_SUBJECTS:
+                light_on = pd.notna(r["조도"]) and r["조도"] >= LIGHT_ON
+                cool_on = pd.notna(r["온도"]) and r["온도"] < TEMP_COLD
+                if light_on:
+                    move_light += 1
+                elif cool_on:
+                    move_cool += 1
+                else:
+                    move_ok += 1
+
+        total_move = move_ok + move_light + move_cool
+        if total_move == 0:
+            st.info("분석 범위에 이동수업 시간 데이터가 없어요.")
+        else:
+            mdf = pd.DataFrame({
+                "상태": ["✅ 잘 껐음", "🔴 불 켜둠(낭비)", "🔴 냉방 켜둠(낭비)"],
+                "개수": [move_ok, move_light, move_cool]
+            })
+            mdf = mdf[mdf["개수"] > 0]
+            fig4 = px.pie(mdf, names="상태", values="개수", hole=0.5,
+                color="상태", color_discrete_map={
+                    "✅ 잘 껐음": "#2e7d32",
+                    "🔴 불 켜둠(낭비)": "#e53935",
+                    "🔴 냉방 켜둠(낭비)": "#ef6c00"})
+            fig4.update_traces(textinfo="percent+label",
+                textfont=dict(color="white", shadow=shadow4),   # ★ 그림자
+                marker=dict(line=dict(color="#0d3b66", width=3)))
+            fig4.update_layout(height=400, title="", **layout)   # ★ 제목 비움
+            st.plotly_chart(fig4, use_container_width=True)
+
+            waste_cnt = move_light + move_cool
+            waste_pct = waste_cnt / total_move * 100
+            if waste_pct == 0:
+                st.success(f"🎉 훌륭해요! 이동수업 {total_move}회 모두 에너지를 잘 절약했어요!")
+            else:
+                st.warning(f"⚠️ 이동수업 {total_move}회 중 {waste_cnt}회({waste_pct:.0f}%)에서 "
+                           f"에너지 낭비가 있었어요. 이동수업 때 불·냉방을 꼭 끕시다!")
 
 # ========================================
 # 페이지 6: 프로젝트 목표 (계층적 디자인)
@@ -814,9 +1083,9 @@ elif page == "🎯 프로젝트 목표":
     # 세부 목표 (작게, 그리드로)
     st.markdown('<h2 class="goal-sub-title">📌 이를 위한 세부 목표</h2>', unsafe_allow_html=True)
     goals=[
-        ("🚶","이동수업 낭비 감지","체육 등 빈 교실에 냉방 켜둔 걸 자동 감지","#e53935"),
-        ("📊","데이터 기반 관리","감이 아닌 실제 데이터로 냉난방 관리","#1e88e5"),
-        ("🌡️","쾌적한 환경","적정 온도·CO₂ 유지로 집중도 UP","#00897b"),
+        ("🚶","이동수업 낭비 감지","체육 등 빈 교실에 냉방·조명 켜둔 걸 자동 감지","#e53935"),
+        ("💡","조명 낭비 감지","조도 센서로 이동수업 중 불 켜둠을 포착","#fbc02d"),
+        ("📊","데이터 기반 관리","감이 아닌 실제 데이터로 냉방·조명 관리","#1e88e5"),
         ("🏆","절약 동기부여","반별 랭킹으로 자발적 절약 유도","#f9a825"),
         ("🌱","환경 보호","탄소 배출을 줄여 지구를 지킴","#43a047"),
     ]
