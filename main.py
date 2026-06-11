@@ -1,3 +1,5 @@
+# 6월 11일 목요일 코드
+
 import time
 import gc
 import json
@@ -67,6 +69,15 @@ def read_light():
     light_pct = raw / 65535 * 100
     return light_pct
 
+# 학교 WiFi 이름 (이거면 "정상", 아니면 "테스트")
+SCHOOL_WIFI = "senWiFi_Free"
+
+def get_status(connected_ssid):
+    """학교 WiFi면 정상, 아니면 테스트."""
+    if connected_ssid == SCHOOL_WIFI:
+        return "정상"
+    else:
+        return "테스트"
 
 def measure():
     """센서 1회 측정. 실패 항목은 None."""
@@ -87,10 +98,10 @@ def measure():
 def connect_wifi():
     wlan = network.WLAN(network.STA_IF)
     wlan.active(True)
-    time.sleep(5)   # 워밍업 더 길게
+    time.sleep(5)
 
     if wlan.isconnected():
-        return wlan
+        return wlan, None  # 이미 연결됨 (ssid는 모름)
 
     for attempt in range(5):
         feed()
@@ -98,15 +109,12 @@ def connect_wifi():
         try:
             scan_result = wlan.scan()
             available = [w[0].decode() for w in scan_result]
-            print(">>> 주변 WiFi 개수:", len(available))
             print(">>> 주변 WiFi 목록:", available)
         except Exception as e:
             print(">>> 스캔 에러:", e)
             time.sleep(2)
             continue
 
-        # wifi_config에 있는 WiFi 찾기
-        print(">>> 내가 찾는 WiFi:", list(wifi_config.WIFI_NETWORKS.keys()))
         for ssid, pw in wifi_config.WIFI_NETWORKS.items():
             if ssid in available:
                 print(">>> 발견! 연결 시도:", ssid)
@@ -114,8 +122,8 @@ def connect_wifi():
                 for _ in range(15):
                     feed()
                     if wlan.isconnected():
-                        print(">>> 연결 성공! IP:", wlan.ifconfig()[0])
-                        return wlan
+                        print(">>> 연결 성공! IP:", wlan.ifconfig()[0], "/ WiFi:", ssid)
+                        return wlan, ssid   # ★ 연결된 ssid도 반환!
                     time.sleep(1)
                 print(">>>", ssid, "연결 실패")
                 wlan.disconnect()
@@ -127,7 +135,7 @@ def connect_wifi():
             feed()
             time.sleep(1)
     print(">>> WiFi 최종 실패")
-    return None
+    return None, None
 
 
 # ===== URL 분해 =====
@@ -169,12 +177,11 @@ def https_get(url):
 
 
 # ===== 시트로 전송 (한 건) =====
-def send_once(temp, hum, light):
+def send_once(temp, hum, light, status):
     try:
-        params = "class={}&temp={}&hum={}&light={}".format(
-            wifi_config.CLASS_ID, temp, hum, light)
+        params = "class={}&temp={}&hum={}&light={}&status={}".format(
+            wifi_config.CLASS_ID, temp, hum, light, status)
         full_url = wifi_config.SHEET_URL + "?" + params
-        print(">>> 전송 URL:", full_url)   # ← URL 확인
 
         response = https_get(full_url)
         status_line = response.split("\r\n", 1)[0]
@@ -186,19 +193,12 @@ def send_once(temp, hum, light):
                 if line.lower().startswith("location:"):
                     new_url = line.split(":", 1)[1].strip()
                     break
-            print(">>> 리다이렉트 주소:", new_url)   # ← 새 주소 확인!
-
             if new_url:
                 response2 = https_get(new_url)
                 status_line2 = response2.split("\r\n", 1)[0]
                 print(">>> 2차 응답:", status_line2)
-                # ★ 응답 본문 확인!
-                body2 = response2.split("\r\n\r\n", 1)[-1]
-                print(">>> 2차 본문:", body2[-200:])   # ← 핵심!
                 return "200" in status_line2
             return False
-        body = response.split("\r\n\r\n", 1)[-1]
-        print(">>> 본문:", body[-200:])
         return "200" in status_line
     except Exception as e:
         print(">>> 전송 실패:", e)
@@ -206,14 +206,14 @@ def send_once(temp, hum, light):
 
 
 # ===== 버퍼링 (전송 실패 시 저장) =====
-def buffer_append(temp, hum, light):
+def buffer_append(temp, hum, light, status):
     try:
         try:
             with open(BUFFER_FILE, "r") as f:
                 lines = f.readlines()
         except OSError:
             lines = []
-        payload = {"temp": temp, "hum": hum, "light": light}
+        payload = {"temp": temp, "hum": hum, "light": light, "status": status}
         lines.append(json.dumps(payload) + "\n")
         if len(lines) > BUFFER_MAX:
             lines = lines[-BUFFER_MAX:]
@@ -225,7 +225,6 @@ def buffer_append(temp, hum, light):
 
 
 def buffer_flush():
-    """버퍼에 쌓인 것 재전송. 성공한 건 제거."""
     try:
         with open(BUFFER_FILE, "r") as f:
             lines = f.readlines()
@@ -239,10 +238,10 @@ def buffer_flush():
         feed()
         try:
             p = json.loads(line)
-            if not send_once(p["temp"], p["hum"], p["light"]):
+            if not send_once(p["temp"], p["hum"], p["light"], p["status"]):  # ★ status
                 survivors.append(line)
         except ValueError:
-            pass  # 깨진 줄 버림
+            pass
     try:
         with open(BUFFER_FILE, "w") as f:
             f.writelines(survivors)
@@ -252,11 +251,15 @@ def buffer_flush():
 
 # ===== 메인 =====
 print(">>> WiFi 연결 시도")
-wlan = connect_wifi()
+wlan, connected_ssid = connect_wifi()   # ★ ssid도 받음
 if not wlan:
     print(">>> WiFi 연결 실패! reset")
     time.sleep(2)
     reset()
+
+# 상태 결정
+status = get_status(connected_ssid)
+print(">>> 데이터 상태:", status, "(연결 WiFi:", connected_ssid, ")")
 
 # ★ WiFi 연결 성공 후에 와치독 시작! (8초 → 넉넉하게 늘림)
 from machine import WDT
@@ -272,20 +275,21 @@ while True:
     try:
         feed()
         print(">>> ===== 루프 #" + str(loop_count) + " =====")
-
+        
         if not wlan.isconnected():
             print(">>> WiFi 끊김! 재연결")
-            wlan = connect_wifi()
+            wlan, connected_ssid = connect_wifi()   # ★ ssid도 다시 받음
             if not wlan:
                 reset()
-
+            status = get_status(connected_ssid)   # 상태도 다시 정함
+        
         temp, hum, light = measure()
-        print("온도:", temp, "습도:", hum, "조도:", light)
+        print("온도:", temp, "습도:", hum, "조도:", light, "상태:", status)
 
-        if temp is not None and send_once(temp, hum, light):
-            buffer_flush()  # 그동안 쌓인 것도 전송
+        if temp is not None and send_once(temp, hum, light, status):  # ★ status 추가
+            buffer_flush()
         else:
-            buffer_append(temp, hum, light)
+            buffer_append(temp, hum, light, status)  # ★ 버퍼에도 status
 
     except Exception as e:
         print(">>> 루프 에러:", e)
