@@ -98,7 +98,10 @@ def measure():
 def connect_wifi():
     wlan = network.WLAN(network.STA_IF)
     wlan.active(True)
-    time.sleep(5)
+    
+    for _ in range(5):       # ← time.sleep(5) 대신
+        feed()
+        time.sleep(1)
 
     if wlan.isconnected():
         return wlan, None  # 이미 연결됨 (ssid는 모름)
@@ -261,9 +264,6 @@ if not wlan:
 status = get_status(connected_ssid)
 print(">>> 데이터 상태:", status, "(연결 WiFi:", connected_ssid, ")")
 
-# ★ WiFi 연결 성공 후에 와치독 시작! (8초 → 넉넉하게 늘림)
-from machine import WDT
-# ★ WiFi 연결 성공 후에 와치독 시작!
 wdt = WDT(timeout=8388)  # 피코 최대값 약 8.3초
 print(">>> 와치독 시작!")
 
